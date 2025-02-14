@@ -1,0 +1,5 @@
+C:\Ejercicios Tarea 8\Ejercicios Tarea 8\Microcontroladores\Microcontrolador Project 1\ConsoleApp1\obj\Debug\net7.0\ConsoleApp1.csproj.AssemblyReference.cache
+C:\Ejercicios Tarea 8\Ejercicios Tarea 8\Microcontroladores\Microcontrolador Project 1\ConsoleApp1\obj\Debug\net7.0\ConsoleApp1.GeneratedMSBuildEditorConfig.editorconfig
+C:\Ejercicios Tarea 8\Ejercicios Tarea 8\Microcontroladores\Microcontrolador Project 1\ConsoleApp1\obj\Debug\net7.0\ConsoleApp1.AssemblyInfoInputs.cache
+C:\Ejercicios Tarea 8\Ejercicios Tarea 8\Microcontroladores\Microcontrolador Project 1\ConsoleApp1\obj\Debug\net7.0\ConsoleApp1.AssemblyInfo.cs
+C:\Ejercicios Tarea 8\Ejercicios Tarea 8\Microcontroladores\Microcontrolador Project 1\ConsoleApp1\obj\Debug\net7.0\ConsoleApp1.csproj.CoreCompileInputs.cache

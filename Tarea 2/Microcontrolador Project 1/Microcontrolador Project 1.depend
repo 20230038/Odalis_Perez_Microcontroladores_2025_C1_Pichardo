@@ -1,0 +1,6 @@
+# depslib dependency file v1.0
+1739506963 source:c:\ejercicios tarea 8\ejercicios tarea 8\microcontroladores\microcontrolador project 1\main.c
+	<stdio.h>
+	<stdlib.h>
+	<stdbool.h>
+
