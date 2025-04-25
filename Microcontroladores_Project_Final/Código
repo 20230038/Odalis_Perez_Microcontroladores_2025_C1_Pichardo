@@ -1,1 +1,467 @@
+#include <string.h>
+#include <stdio.h>
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include <stdlib.h>
 
+#define TAG "ESP32_WEB"
+#define WIFI_PASSWORD "Alex1623"
+#define MAX_HTML_SIZE 100000
+#define MAX_GPIO 40
+
+typedef enum {
+    MODE_ASTABLE,
+    MODE_MONOASTABLE,
+    MODE_PWM
+} signal_mode_t;
+
+typedef struct {
+    int gpio_num;
+    const char *description;
+    bool is_on;
+    float frequency;
+    signal_mode_t mode;
+    float r1, r2, c1;
+    const char* unit_r1;
+    const char* unit_r2;
+    const char* unit_c1;
+
+    // PWM-specific
+    float pwm_freq;
+    int pwm_divisor;
+    float pwm_duty_cycle;
+} gpio_state_t;
+
+gpio_state_t gpio_states[] = {
+    {0, "Strap Pin", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {2, "LED_BUILTIN, ADC2_CH2", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {4, "ADC2_CH0, TOUCH0", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {5, "ADC2_CH1, VSPI_SS", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {12, "MTDI, ADC2_CH5, TOUCH5", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {13, "MTCK, ADC2_CH4, TOUCH4", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {14, "MTMS, ADC2_CH6, TOUCH6", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {15, "MTDO, ADC2_CH3, TOUCH3", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {16, "RX2", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {17, "TX2", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {18, "VSPI_CLK", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {19, "VSPI_MISO", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {21, "I2C SDA", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {22, "I2C SCL", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {23, "VSPI_MOSI", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {25, "DAC1, ADC2_CH8", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {26, "DAC2, ADC2_CH9", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {27, "ADC2_CH7, TOUCH7", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {32, "ADC1_CH4, TOUCH9", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+    {33, "ADC1_CH5, TOUCH8", false, 0, MODE_ASTABLE, 0, 0, 0, "Ohm", "Ohm", "F", 1000, 1, 50},
+};
+
+#define GPIO_COUNT (sizeof(gpio_states)/sizeof(gpio_state_t))
+
+void initialize_all_gpios() {
+    for (int i = 0; i < GPIO_COUNT; i++) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << gpio_states[i].gpio_num),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(gpio_states[i].gpio_num, 0); // Apagar por defecto
+        ESP_LOGI(TAG, "GPIO %d (%s) inicializado como salida apagada.", gpio_states[i].gpio_num, gpio_states[i].description);
+    }
+}
+
+float convert_to_base_unit(float value, const char* unit) {
+    if (strcmp(unit, "KOhm") == 0) return value * 1000;
+    if (strcmp(unit, "MOhm") == 0) return value * 1000000;
+    if (strcmp(unit, "uF") == 0) return value * 1e-6;
+    if (strcmp(unit, "nF") == 0) return value * 1e-9;
+    if (strcmp(unit, "pF") == 0) return value * 1e-12;
+    return value;
+}
+
+void calculate_astable(float r1, float r2, float c1, float* frequency, float* t_high, float* t_low) {
+    *t_high = 0.693 * (r1 + r2) * c1;
+    *t_low = 0.693 * r2 * c1;
+    *frequency = 1.44 / ((r1 + (2.0 * r2)) * c1);
+}
+
+void calculate_monoastable(float r1, float c1, float* frequency, float* t_high) {
+    *t_high = 1.1 * r1 * c1;
+    *frequency = 1.0 / *t_high;
+}
+int find_gpio_index(int gpio) {
+    for (int i = 0; i < GPIO_COUNT; i++) {
+        if (gpio_states[i].gpio_num == gpio) {
+            return i;
+        }
+    }
+    return -1; // No encontrado
+}
+
+void start_gpio_pwm(int gpio, float r1, float r2, float c1, signal_mode_t mode, float pwm_freq, int pwm_divisor, float duty_cycle) {
+    if (gpio < 0 || gpio > 39) return;
+
+    int index = find_gpio_index(gpio);
+    if (index == -1) {
+        ESP_LOGE(TAG, "GPIO %d no encontrado en la lista de gpio_states", gpio);
+        return;
+    }
+
+    float frequency = 0;
+    float t_high = 0, t_low = 0;
+
+    if (mode == MODE_ASTABLE) {
+        calculate_astable(r1, r2, c1, &frequency, &t_high, &t_low);
+    } else if (mode == MODE_MONOASTABLE) {
+        calculate_monoastable(r1, c1, &frequency, &t_high);
+    } else if (mode == MODE_PWM) {
+        frequency = pwm_freq;
+        t_high = (duty_cycle / 100.0) * (1.0 / frequency);
+        t_low = (1.0 / frequency) - t_high;
+    }
+
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = gpio,
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .channel = gpio % 8,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = gpio % 4,
+        .duty = 4000,
+        .hpoint = 0,
+    };
+
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_HIGH_SPEED_MODE,
+        .timer_num = gpio % 4,
+        .duty_resolution = LEDC_TIMER_13_BIT,
+        .freq_hz = (uint32_t)frequency,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+
+    ledc_timer_config(&ledc_timer);
+    ledc_channel_config(&ledc_channel);
+
+    uint32_t duty_val = 0;
+    if (mode == MODE_ASTABLE) {
+        duty_val = (uint32_t)((t_high / (t_high + t_low)) * 8191);
+    } else if (mode == MODE_PWM) {
+        duty_val = (uint32_t)((duty_cycle / 100.0) * 8191);
+    } else {
+        duty_val = 8191;
+    }
+
+    ledc_set_duty(ledc_channel.speed_mode, ledc_channel.channel, duty_val);
+    ledc_update_duty(ledc_channel.speed_mode, ledc_channel.channel);
+
+    // Logs seguros
+    gpio_state_t *state = &gpio_states[index];
+    ESP_LOGI(TAG, "=====================================");
+    ESP_LOGI(TAG, "Configuración de GPIO %d (%s):", gpio, state->description);
+    ESP_LOGI(TAG, "Modo: %s", mode == MODE_ASTABLE ? "Astable" : (mode == MODE_MONOASTABLE ? "Monoastable" : "PWM"));
+    if (mode == MODE_ASTABLE) {
+        ESP_LOGI(TAG, "Frecuencia: %.2f Hz, T_high: %.2f s, T_low: %.2f s", frequency, t_high, t_low);
+    } else if (mode == MODE_MONOASTABLE) {
+        ESP_LOGI(TAG, "Frecuencia: %.2f Hz, T_high: %.2f s", frequency, t_high);
+    } else if (mode == MODE_PWM) {
+        ESP_LOGI(TAG, "Frecuencia: %.2f Hz, Ciclo de trabajo: %.2f%%", pwm_freq, duty_cycle);
+        ESP_LOGI(TAG, "Tiempo alto: %.6f s, Tiempo bajo: %.6f s", t_high, t_low);
+        ESP_LOGI(TAG, "Tiempo total: %.6f s", t_high + t_low);
+        ESP_LOGI(TAG, "Divisor: %d", pwm_divisor);
+    }
+    ESP_LOGI(TAG, "R1: %.2f %s, R2: %.2f %s, C1: %.2f %s",
+             r1, state->unit_r1, r2, state->unit_r2, c1, state->unit_c1);
+    ESP_LOGI(TAG, "=====================================");
+}
+
+
+
+
+char* generate_html_page() { 
+    static char html[MAX_HTML_SIZE];
+    char temp[4096];
+
+    snprintf(html, sizeof(html), "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 GPIO Web</title><style>body{background:#121212;color:white;font-family:sans-serif;text-align:center}.card{background:#1e1e1e;margin:10px;padding:15px;border-radius:10px;display:inline-block;width:300px;border:1px solid #ff6f00;transition:transform 0.2s ease}.card:hover{transform:scale(1.03)}.button{margin:5px;padding:10px 15px;border:none;border-radius:5px;background:#ff6f00;color:white;cursor:pointer;transition:transform 0.2s ease}.button:hover{background:#ffa000;transform:scale(1.05)}input,select{padding:5px;margin-top:5px;width:80%%}</style></head><body><h1>Control de GPIO - ESP32</h1><div>");
+
+    for (int i = 0; i < GPIO_COUNT; ++i) {
+        int gpio = gpio_states[i].gpio_num;
+        bool is_on = gpio_states[i].is_on;
+
+        snprintf(temp, sizeof(temp),
+            "<div class='card'><h3>GPIO %d</h3><p>%s</p><p>Estado: <strong>%s</strong></p>"
+            "<button class='button' onclick='toggleGPIO(%d, 1)'>Encender</button>"
+            "<button class='button' onclick='toggleGPIO(%d, 0)'>Apagar</button><br>"
+            "<div id='options-%d' style='margin-top:10px;display:%s'>"
+            "<label>Configuración:</label><br>"
+            "<select id='mode_%d' onchange='updateMode(%d)'>"
+            "<option value='astable'%s>Astable</option>"
+            "<option value='monoastable'%s>Monoastable</option>"
+            "<option value='pwm'%s>PWM</option>"
+            "</select><br>"
+
+            "<div id='astable-options-%d' style='display:%s;'>"
+            "<label>R1 (%s):</label><input type='number' id='r1_%d' min='1' placeholder='Valor de R1'/><br>"
+            "<select id='unit_r1_%d'>"
+            "<option value='Ohm'>Ohm</option>"
+            "<option value='KOhm'>KOhm</option>"
+            "<option value='MOhm'>MOhm</option>"
+            "</select><br>"
+            "<label>R2 (%s):</label><input type='number' id='r2_%d' min='1' placeholder='Valor de R2'/><br>"
+            "<select id='unit_r2_%d'>"
+            "<option value='Ohm'>Ohm</option>"
+            "<option value='KOhm'>KOhm</option>"
+            "<option value='MOhm'>MOhm</option>"
+            "</select><br>"
+            "<label>C1 (%s):</label><input type='number' id='c1_%d' min='1' placeholder='Valor de C1'/><br>"
+            "<select id='unit_c1_%d'>"
+            "<option value='F'>F</option>"
+            "<option value='uF'>uF</option>"
+            "<option value='nF'>nF</option>"
+            "<option value='pF'>pF</option>"
+            "</select><br>"
+            "</div>"
+
+            "<div id='pwm-options-%d' style='display:%s;'>"
+            "<label>Frecuencia PWM (Hz):</label><input type='number' id='pwm_freq_%d' min='1' placeholder='Frecuencia'/><br>"
+            "<label>Divisor:</label><input type='number' id='pwm_div_%d' min='1' placeholder='Divisor del temporizador'/><br>"
+            "<label>Ciclo de trabajo (%%):</label><input type='number' id='pwm_duty_%d' min='1' max='100' placeholder='Duty Cycle'/><br>"
+            "</div>"
+
+            "<button class='button' onclick='setOptions(%d)'>Aplicar</button></div></div>",
+
+            gpio, gpio_states[i].description,
+            is_on ? "ENCENDIDO" : "APAGADO",
+            gpio, gpio,
+            gpio, is_on ? "block" : "none",
+            gpio, gpio,
+            gpio_states[i].mode == MODE_ASTABLE ? " selected" : "",
+            gpio_states[i].mode == MODE_MONOASTABLE ? " selected" : "",
+            gpio_states[i].mode == MODE_PWM ? " selected" : "",
+
+            gpio,
+            gpio_states[i].mode == MODE_ASTABLE || gpio_states[i].mode == MODE_MONOASTABLE ? "block" : "none",
+            gpio_states[i].unit_r1, gpio, gpio,
+            gpio_states[i].unit_r2, gpio, gpio,
+            gpio_states[i].unit_c1, gpio, gpio,
+
+            gpio,
+            gpio_states[i].mode == MODE_PWM ? "block" : "none",
+            gpio, gpio, gpio,
+
+            gpio
+        );
+
+        strncat(html, temp, sizeof(html) - strlen(html) - 1);
+    }
+
+    strncat(html,
+        "</div><script>"
+        "function toggleGPIO(pin, state) {"
+        "fetch(`/toggle?gpio=${pin}&state=${state}`)"
+        ".then(res => res.text()).then(html => document.body.innerHTML = html);"
+        "}"
+        "function setOptions(pin) {"
+        "let mode = document.getElementById(`mode_${pin}`).value;"
+        "let r1 = document.getElementById(`r1_${pin}`).value;"
+        "let r2 = document.getElementById(`r2_${pin}`).value;"
+        "let c1 = document.getElementById(`c1_${pin}`).value;"
+        "let unit_r1 = document.getElementById(`unit_r1_${pin}`).value;"
+        "let unit_r2 = document.getElementById(`unit_r2_${pin}`).value;"
+        "let unit_c1 = document.getElementById(`unit_c1_${pin}`).value;"
+        "let pwm_freq = document.getElementById(`pwm_freq_${pin}`).value;"
+        "let pwm_div = document.getElementById(`pwm_div_${pin}`).value;"
+        "let pwm_duty = document.getElementById(`pwm_duty_${pin}`).value;"
+        "fetch(`/freq?gpio=${pin}&mode=${mode}&r1=${r1}&r2=${r2}&c1=${c1}&unit_r1=${unit_r1}&unit_r2=${unit_r2}&unit_c1=${unit_c1}&pwm_freq=${pwm_freq}&pwm_div=${pwm_div}&pwm_duty=${pwm_duty}`)"
+        ".then(res => res.text()).then(html => document.body.innerHTML = html);"
+        "}"
+        "function updateMode(pin) {"
+        "let mode = document.getElementById(`mode_${pin}`).value;"
+        "document.getElementById(`astable-options-${pin}`).style.display = (mode === 'astable' || mode === 'monoastable') ? 'block' : 'none';"
+        "document.getElementById(`pwm-options-${pin}`).style.display = (mode === 'pwm') ? 'block' : 'none';"
+        "}"
+        "</script></body></html>",
+        sizeof(html) - strlen(html) - 1);
+
+    return html;
+}
+
+
+// Función que se llama después de cambiar los parámetros en la interfaz web
+esp_err_t freq_handler(httpd_req_t *req) {
+    char buf[300];
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len <= 1 || httpd_req_get_url_query_str(req, buf, buf_len) != ESP_OK)
+        return httpd_resp_send_404(req);
+
+    int gpio = -1;
+    char param[32];
+
+    httpd_query_key_value(buf, "gpio", param, sizeof(param));
+    gpio = atoi(param);
+
+    for (int i = 0; i < GPIO_COUNT; i++) {
+        if (gpio_states[i].gpio_num == gpio) {
+            gpio_state_t *state = &gpio_states[i];
+
+            httpd_query_key_value(buf, "mode", param, sizeof(param));
+            if (strcmp(param, "astable") == 0) state->mode = MODE_ASTABLE;
+            else if (strcmp(param, "monoastable") == 0) state->mode = MODE_MONOASTABLE;
+            else state->mode = MODE_PWM;
+
+            httpd_query_key_value(buf, "r1", param, sizeof(param)); state->r1 = atof(param);
+            httpd_query_key_value(buf, "r2", param, sizeof(param)); state->r2 = atof(param);
+            httpd_query_key_value(buf, "c1", param, sizeof(param)); state->c1 = atof(param);
+
+            httpd_query_key_value(buf, "unit_r1", param, sizeof(param)); state->unit_r1 = strdup(param);
+            httpd_query_key_value(buf, "unit_r2", param, sizeof(param)); state->unit_r2 = strdup(param);
+            httpd_query_key_value(buf, "unit_c1", param, sizeof(param)); state->unit_c1 = strdup(param);
+
+            httpd_query_key_value(buf, "pwm_freq", param, sizeof(param)); state->pwm_freq = atof(param);
+            httpd_query_key_value(buf, "pwm_div", param, sizeof(param)); state->pwm_divisor = atoi(param);
+            httpd_query_key_value(buf, "pwm_duty", param, sizeof(param)); state->pwm_duty_cycle = atof(param);
+
+            start_gpio_pwm(
+                gpio,
+                convert_to_base_unit(state->r1, state->unit_r1),
+                convert_to_base_unit(state->r2, state->unit_r2),
+                convert_to_base_unit(state->c1, state->unit_c1),
+                state->mode,
+                state->pwm_freq,
+                state->pwm_divisor,
+                state->pwm_duty_cycle
+            );
+            break;
+        }
+    }
+
+    char* html = generate_html_page();
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Declaración the gpio_toggle_handler function before it's used
+esp_err_t toggle_handler(httpd_req_t *req) {
+    char buf[100];
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    int gpio = -1, state = 0;
+
+    if (buf_len > 1 && httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+        char param[10];
+        if (httpd_query_key_value(buf, "gpio", param, sizeof(param)) == ESP_OK) gpio = atoi(param);
+        if (httpd_query_key_value(buf, "state", param, sizeof(param)) == ESP_OK) state = atoi(param);
+    }
+
+    for (int i = 0; i < GPIO_COUNT; i++) {
+        if (gpio_states[i].gpio_num == gpio) {
+            gpio_states[i].is_on = (state == 1);
+            if (!gpio_states[i].is_on) {
+                // Apagar el pin
+                gpio_reset_pin(gpio);
+                gpio_set_direction(gpio, GPIO_MODE_OUTPUT);
+                gpio_set_level(gpio, 0);
+            } else {
+                start_gpio_pwm(
+                    gpio,
+                    convert_to_base_unit(gpio_states[i].r1, gpio_states[i].unit_r1),
+                    convert_to_base_unit(gpio_states[i].r2, gpio_states[i].unit_r2),
+                    convert_to_base_unit(gpio_states[i].c1, gpio_states[i].unit_c1),
+                    gpio_states[i].mode,
+                    gpio_states[i].pwm_freq,
+                    gpio_states[i].pwm_divisor,
+                    gpio_states[i].pwm_duty_cycle
+                );
+            }
+            break;
+        }
+    }
+
+    char* html = generate_html_page();
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t root_handler(httpd_req_t *req) {
+    const char* html = generate_html_page();  // Usamos el buffer estático directamente
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static httpd_handle_t server = NULL;
+
+void start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;  // Aumenta si tu handler lo requiere
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t uri_root = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = root_handler,
+            .user_ctx  = NULL
+        };
+        httpd_uri_t uri_toggle = {
+            .uri      = "/toggle",
+            .method   = HTTP_GET,
+            .handler  = toggle_handler,
+            .user_ctx = NULL
+        };
+        httpd_uri_t uri_freq = {
+            .uri      = "/freq",
+            .method   = HTTP_GET,
+            .handler  = freq_handler,
+            .user_ctx = NULL
+        };
+    
+        if (httpd_register_uri_handler(server, &uri_root) != ESP_OK)
+            ESP_LOGE("WEB", "Fallo al registrar URI /");
+        if (httpd_register_uri_handler(server, &uri_toggle) != ESP_OK)
+            ESP_LOGE("WEB", "Fallo al registrar URI /toggle");
+        if (httpd_register_uri_handler(server, &uri_freq) != ESP_OK)
+            ESP_LOGE("WEB", "Fallo al registrar URI /freq");
+    } else {
+        ESP_LOGE("WEB", "Fallo al iniciar servidor web");
+    }
+}    
+void wifi_init_softap(void) {
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = "ESP32-AP",
+            .ssid_len = strlen("ESP32-AP"),
+            .channel = 1,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = 4,
+            .beacon_interval = 100,
+        },
+    };
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    esp_wifi_start();
+}
+
+void app_main(void) {
+    // Inicio de NVS
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    // Inicio de WiFi
+    wifi_init_softap();
+
+    // Inicio de todos los GPIOs
+    initialize_all_gpios();
+
+    // Inicio servidor web
+    start_webserver();
+}
